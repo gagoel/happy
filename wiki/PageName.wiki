@@ -1,0 +1,307 @@
+*Happy* is a framework that allows Hadoop jobs to be written and run in [http://www.python.org/doc/2.2.1/ Python 2.2] using [http://www.jython.org/Project/index.html Jython].  
+
+= Quickstart =
+
+* You may need to set JAVA_HOME.  On the Mac this can be done by adding this line to ~/.profile
+  <pre>export JAVA_HOME=/System/Library/Frameworks/JavaVM.framework/Home</pre>
+
+
+* To run the happy wordcount demo on the Star Wars Wookiepedia dump, cd to $MYHOME and run:
+
+<pre>./bin/happy.sh thirdparty/happy/examples/wordcount.py /data/starwars/starwars-20080207-pages-current.xml &lt;output&gt;</pre>
+
+== Add Happy to your Path ==
+
+* In order to run happy scripts and use the dfs tools, add <code>$MYHHOME/thirdparty/happy/bin</code> to your <code>PATH</code>.  Use an absolute path (no ~s) in order for scripts to run correctly.
+
+== Installing LZO ==
+
+In order to read LZO-compressed sequence files locally, you'll need to install the LZO libaries.  
+
+* On Gentoo Linux, <code>emerge lzo</code>.
+
+* On Mac OS X, download the latest LZO bundle from [http://www.oberhumer.com/opensource/lzo/download/ here], unpack it, and run the commands below. The lzo tests will fail and complain, but the install should still succeed.
+<pre>
+./configure --enable-shared
+make
+sudo make install
+</pre>
+
+= Happy Overview =
+
+Map-reduce jobs in Happy are defined by sub-classing <code>happy.HappyJob</code> and implementing a <code>map(records, task)</code> and <code>reduce(key, values, task)</code> function.  Then you create an instance of the class, set the job parameters (such as inputs and outputs) and call <code>run()</code>.
+
+When you call <code>run()</code>, Happy serializes your job instance and copies it and all accompanying libraries out to the Hadoop cluster.  Then for each task in the Hadoop job, your job instance is de-serialized and <code>map</code> or <code>reduce</code> is called.
+
+== Happy Path ==
+
+Happy libraries can be specified using the environment variable <code>HAPPY_PATH</code>.  These are added to the Python path at startup, and are also automatically included when jobs are sent to Hadoop.  The path is stored in <code>happy.path</code> and can be edited at runtime.
+
+= Happy Examples =
+
+== Happy WordCount ==
+
+Below is the <code>thirdparty/happy/examples/wordcount.py</code> script, also found [https://svn.metaweb.com/svn/happy/trunk/examples/wordcount.py here].  This script takes a text file as input and outputs a count of all of the words in the file.  
+
+<pre>
+import sys, happy, happy.log
+
+happy.log.setLevel("debug")
+log = happy.log.getLog("wordcount")
+
+class WordCount(happy.HappyJob):  
+    def __init__(self, inputpath, outputpath):
+        happy.HappyJob.__init__(self)
+        self.inputpaths = inputpath
+        self.outputpath = outputpath
+      
+    def map(self, records, task):
+        for _, value in records:
+            for word in value.split():
+                task.collect(word, "1")
+    
+    def reduce(self, key, values, task):
+        count = 0;
+        for _ in values: count += 1
+        task.collect(key, str(count))
+        log.debug(key + ":" + str(count))
+        happy.results["words"] = happy.results.setdefault("words", 0) + count
+        happy.results["unique"] = happy.results.setdefault("unique", 0) + 1
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print "Usage: <inputpath> <outputpath>"
+        sys.exit(-1)
+    wc = WordCount(sys.argv[1], sys.argv[2])
+    results = wc.run()
+    print str(sum(results["words"])) + " total words"
+    print str(sum(results["unique"])) + " unique words"
+</pre>
+
+== Constructor ==
+
+<pre>
+    def __init__(self, inputpath, outputpath):
+        happy.HappyJob.__init__(self)
+        self.inputpaths = inputpath
+        self.outputpath = outputpath
+        self.inputformat = "text"
+</pre>
+
+The job parameters are set here.  <code>self.inputpaths</code> can be a single path or a list of paths, and specifies the files and directories in the DFS to use for the job.  <code>self.outputpath</code> specifies the output directory.  <code>self.inputformat = "text"</code> specifies that the input files will be treated as text files, splitting records on newlines.  The key is the byte offset of the line, and the value is the line of text.
+
+== Map Function ==
+
+<pre>
+    def map(self, records, task):
+        for _, value in records:
+            for word in value.split():
+                task.collect(word, "1")
+</pre>
+
+The map function takes an iterator over <code>key, value</code> tuples, and a task object that collects output.  The wordcount mapper splits each string, and then sends the key, value pair <code><word>, "1"</code> to the reducer.  The Hadoop cluster then sorts the output by the keys (the words) and groups together the values for processing by the reducer function.
+
+== Reduce Function ==
+
+<pre>
+    def reduce(self, key, values, task):
+        count = 0;
+        for _ in values: count += 1
+        task.collect(key, str(count))
+        log.debug(key + ":" + str(count))
+        happy.results["words"] = happy.results.setdefault("words", 0) + count
+        happy.results["unique"] = happy.results.setdefault("unique", 0) + 1
+</pre>
+
+The reduce function takes a key, an iterator over values, and a task object for collecting output.  The wordcount reducer totals the number of values for each word and emits <code><word>, <count></code>.
+
+== Main Function ==
+
+<pre>
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print "Usage: <inputpath> <outputpath>"
+        sys.exit(-1)
+    wc = WordCount(sys.argv[1], sys.argv[2])
+    results = wc.run()
+    print str(sum(results["words"])) + " total words"
+    print str(sum(results["unique"])) + " unique words"
+</pre>
+
+The job invocation needs to be enclosed in a main block, or else it will get executed on the cluster when the script is called through <code>import</code>.  The job is dispatched by calling <code>run</code>, and a result object is returned that rolls up all of the <code>happy.results</code> objects on the cluster.
+
+== Happy Notes ==
+
+== Input Compression ==
+
+Hadoop will automatically handle compressed text files when the <code>text</code> or <code>keyvalue</code> inputformats are used as long as the input files have appropriate extensions.  The supported formats and extensions are gzip (<code>.gz</code>), zlib (<code>.deflate</code>), and [http://www.oberhumer.com/opensource/lzo/ lzo] (<code>.lzo</code> - the default).
+
+Only one map task per compressed input file can be run because compressed files cannot be broken up.  An alternative is to use compressed sequence files.
+
+== Output Compression ==
+
+Output compression of text and sequence files can be enabled by setting <code>compressoutput=True</code>.  The codec can be selected by setting <code>compressiontype</code> to <code>zlib</code>, <code>gzip</code>, or <code>lzo</code> (default).
+
+== Sequence Files ==
+
+Sequence Files are Hadoop's binary file format for storing and compressing sequential key-value data.  You can tell a sequence file because the first three characters are <code>SEQ</code> followed by binary data.  Sequence files store the Java classes for serializing the keys and values (most often these are type <code>Text</code>) and the codec used for compression.  They are a fast and efficient way to store data that you're using for map-reduce jobs.
+
+Enable sequence file compression by setting <code>compressoutput=True</code>.  Sequence file compression can be set to <code>BLOCK</code> (default) or <code>RECORD</code> using the <code>sequencetype</code> parameter.  Block compression allows sequence files to be split on a block boundary (128MB in our system), and record compression allows sequence files to be split at any record.  Block compression is significantly faster and more efficient than record compression.
+
+== Results Object ==
+
+Happy allows result data to be sent from tasks executed on the cluster to the calling process through the <code>happy.results</code> dictionary.  Any map or reduce task can write to <code>happy.results</code> using any key, and then all of the dictionaries are combined, and returned from <code>HappyJob.run()</code> as a single dictionary with lists of values for each key.  The data files that are passed back are compressed, so a reasonable large amount of data can be returned quickly, but this won't work well if the results use up too much memory on the client process.
+
+= Happy APIs =
+
+== HappyJob Parameters ==
+These are job parameters that can be set on <code>happy.HappyJob</code>.
+
+== <code>jobname</code> ==
+A name for the job.
+
+== <code>inputpaths</code> ==
+REQUIRED - A single input path or array of input paths in the DFS.  
+
+== <code>outputpath</code> ==
+REQUIRED - The output path in the DFS.
+
+== <code>inputformat</code> ==
+The file input format, either "text" (one value per line), "keyvalue" (one key-value pair per line, separated by a tab), or "sequence" (a binary compressed sequencefile), or "auto" (auto-detect sequence or keyvalue).  The default is "auto".
+
+== <code>outputformat</code> ==
+The file output format, either "text" (one key-value pair per line, separated by a tab), or "sequence" (a binary compressed sequencefile).  The default is "text".
+
+== <code>maptasks</code> ==
+The number of map tasks to run.
+
+== <code>reducetasks</code> ==
+The number of reduce tasks to run.  Set to 0 if you want to skip the reduce step.
+
+== <code>localjob</code> ==
+Set to True if the job should run locally, pulling data from the DFS.  Good for debugging, but be sure that you don't use a file that is too large.
+
+== <code>compressoutput</code> ==
+Set to True to compress <code>text</code> and <code>sequence</code> file output.  False by default.
+
+== <code>compressiontype</code> ==
+Selects a compression codec for output.  Valid values are <code>gzip</code>, <code>zlib</code>, and <code>lzo</code> (default).
+
+== <code>sequencetype</code> ==
+Selects a sequence file compression mode.  Valid values are <code>RECORD</code>, and <code>BLOCK</code> (default).
+
+== <code>jobargs</code> ''(advanced)'' ==
+Overrides and/or sets any hadoop job configuration parameters.  Values should be entered as a dictionary of key/value pairs, where the key is the parameter name and the value is the value the parameter should be set to.
+
+= Job Methods =
+At minimum, a job class needs a <code>map(records, task)</code> function to run.  A <code>reduce(key, values, task)</code> function is required if <code>HappyJob.reducetasks</code> is greater than 0.  Other functions that can be defined for the job are:
+
+== <code>mapconfig()</code> ==
+If this function is defined, it is called before <code>map</code> is called.
+
+== <code>mapclose()</code> ==
+If this function is defined, it is called after all <code>map</code> calls for the current task are done.
+
+== <code>reduceconfig()</code> ==
+If this function is defined, it is called before <code>reduce</code> is called.
+
+== <code>reduceclose()</code> ==
+If this function is defined, it is called after all <code>reduce</code> calls for the current task are done.
+
+== <code>combineconfig()</code> ==
+If this function is defined, it is called before <code>combine</code> is called.
+
+== <code>combine(key, values, task)</code> ==
+If this function is defined, it is called during the combine step.  Map outputs local to the current box can be partially reduced before they are sorted and sent to the reducer.
+
+== <code>combineclose()</code> ==
+If this function is defined, it is called after all <code>combine</code> calls for the current task are done.
+
+= Task Object =
+The task object passed into the map and reduce functions is used to output data and get information about the current task.
+
+== <code>task.collect(key, value)</code> ==
+Collects the key and value as output.
+
+== <code>task.getInputPath()</code> ==
+Returns the input path from which the current records are being read.  This is useful if you're reading from multiple different files and want to have different code run depending on the input.
+
+== <code>task.progress()</code> ==
+Reports progress back to the TaskTracker.  Use this if you have a task that is going to take a very long time to complete (greater than 10 minutes per record).
+
+== <code>task.setStatus(status)</code> ==
+Reports a status message back to the TaskTracker.  Use this to change the message displayed on a task.
+
+= <code>happy</code> module =
+
+== <code>getJobConf()</code> ==
+Retrieves a Hadoop [http://hadoop.apache.org/core/docs/current/api/org/apache/hadoop/mapred/JobConf.html JobConf] that is valid for the current task.
+
+== <code>path</code> ==
+A list of files and directories that will be included with the current job and copied to the cluster.  This is set from the <code>HAPPY_PATH</code> environment variable.
+
+== <code>job</code> ==
+This is only set if the current context is in a server task.  <code>job.getJobConf()</code> returns a Hadoop [http://hadoop.apache.org/core/docs/current/api/org/apache/hadoop/mapred/JobConf.html JobConf] that is valid for the current task.  <code>job.getTaskPartition()</code> returns the current task partition for this context.
+
+== <code>results</code> ==
+This is a dictionary of task results that can be set during a map or reduce task, and is passed back to the client process.
+
+= <code>happy.log</code> module =
+
+The Happy logging module integrates with Hadoop's built-in logging support, which uses Log4J and the Apache Commons Logging adapters.  The log objects used in this module are all instances of the [http://commons.apache.org/logging/commons-logging-1.1.1/apidocs/org/apache/commons/logging/Log.html Apache Log API].  An example useage can be seen in the [[Happy#Happy_WordCount|wordcount example]].
+
+== <code>log</code> ==
+The default log object, with name "happy.task".
+
+== <code>getLog(name)</code> ==
+Gets a named log instance.  The name is prefixed with "happy".
+
+== <code>setLevel(level)</code> ==
+Sets the happy logging level.  Level names are, in order, "trace", "debug", "info", "warn", "error", and "fatal".
+
+= <code>happy.json</code> module =
+
+== <code>encode(o)</code> ==
+Encodes a Python dict, list, string, or other basic type to a JSON string.
+
+== <code>decode(s)</code> ==
+Decodes a JSON string to a Python object.
+
+= <code>happy.dfs</code> module =
+Functions for accessing the Hadoop DFS and the local filesystem.
+
+== <code>getFileSystem(fs="dfs")</code> ==
+Returns a Hadoop <code>[http://hadoop.apache.org/core/docs/current/api/org/apache/hadoop/fs/FileSystem.html FileSystem]</code> object.
+
+== <code>read(path)</code> ==
+Returns a Python file-like object to read the specified DFS file or path.  If a directory is passed given as a parameter, the returned object transparently iterates over all of the files in the directory.
+
+== <code>write(path)</code> ==
+Returns a Python file-like object to write to the specified DFS file or path.  DFS currently doesn't support appends, so you can only create new files using this method.  Be sure to close the file or there will be write errors.
+
+== <code>delete(path)</code> ==
+Deletes a DFS file or directory.
+
+== <code>copyToLocal(path, localpath)</code> ==
+Copies a DFS file or directory to a local file.
+
+== <code>copyFromLocal(localpath, path)</code> ==
+Copies a local file to a DFS file.
+
+== <code>rename(src, dst)</code> ==
+Renames a file or path.
+
+== <code>merge(path, dst)</code> ==
+Merges files in a specified directory to a specified file.
+
+== <code>createCollector(path, fs="dfs", type="text")</code> ==
+Creates an output collector which collects key value pairs at the specified path. Optional parameters are <code>fs</code> which can be <code>dfs</code> (default) for the HDFS filesystem or <code>local</code> for the local filesystem, and <code>type</code> which can be <code>text</code> (default) or <code>sequence</code>.
+
+== <code>createPartitionedCollector(path, fs="dfs", type="text")</code> ==
+Creates a partitioned output collector in the specified directory which collects key value pairs at the specified path. Optional parameters are <code>fs</code> which can be <code>dfs</code> (default) for the HDFS filesystem or <code>local</code> for the local filesystem, and <code>type</code> which can be <code>text</code> (default) or <code>sequence</code>.
+
+== <code>readSequenceFile(path, fs="dfs")</code> ==
+Opens a sequence file for reading, and returns an iterator over the <code>(key, value)</code> tuples.  You need to have the LZO libraries installed in order to read LZO-compressed files.
+
+== <code>getTaskPartition()</code> ==
+Returns an integer indicating which task partition is currently executing.  This number will correspond to the map or reduce task number visible in the Hadoop job tracker.  It returns -1 if not currently in a task.
